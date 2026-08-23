@@ -16,6 +16,10 @@ This repository is a verification harness first and a strategy repository second
 10. A bug fix after the baseline is frozen must begin with a failing regression test that demonstrates the violation, followed by the smallest patch.
 11. Never delete or weaken a failing test without an explicit strategy-spec change.
 12. Do not optimize/refactor strategy semantics during an audit.
+13. A passing static scan does not prove absence of leakage.
+14. A strategy cannot be certified for strategy-specific correctness without a frozen specification/oracle.
+15. Historical PF is not evidence that implementation is correct.
+16. Only the machine verdict `VERIFIED` permits the word verified. `INCOMPLETE / UNVERIFIED` is not a pass.
 
 ## Required output from an audit
 
@@ -52,7 +56,19 @@ def signals(bars: pandas.DataFrame) -> pandas.DataFrame:
     # one row per raw/eligible signal, with signal_time
 ```
 
-The generic causality harness is stronger when `signals()` is supplied.
+Adapters may additionally expose `features`, `eligible_signals`, `proposed_entries`,
+`accepted_entries`, or one aggregate `audit_stages(bars) -> dict[str, DataFrame]`.
+Each stage needs its canonical decision timestamp. Missing features must be reported as
+`FEATURE-LEVEL CAUSALITY UNVERIFIED` when feature causality is mandatory.
+
+## Normal entry point
+
+```bash
+python scripts/verify.py --strategy <name> --candidate <adapter.py> --data <canonical-data>
+```
+
+This emits terminal output plus JSON and Markdown under `reports/`. Exit codes are
+`0=VERIFIED`, `1=FAILED`, and `2=INCOMPLETE / UNVERIFIED`.
 
 ## Interpretation boundary
 

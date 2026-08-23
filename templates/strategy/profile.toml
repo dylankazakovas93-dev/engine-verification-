@@ -1,4 +1,24 @@
 name = "strategy_name"
 version = "1.0"
+
+[semantics]
 tick_size = 0.25
 strict_same_timestamp_reentry = true
+long_only = false
+bar_interval = "1min"
+
+[checks]
+repository_health = true
+deterministic_tests = true
+data_audit = true
+static_scan = true
+ledger = true
+causality = true
+feature_causality = false
+reference_reconciliation = false
+contract_provenance = false
+high_resolution = false
+
+[causality]
+mode = "strong"
+seed = 1729

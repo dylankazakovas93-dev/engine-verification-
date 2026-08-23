@@ -40,3 +40,11 @@ python scripts/audit_roll.py --selected selected_with_contract_id.csv --expected
 ```
 
 Never let a strategy engine choose contracts if the research specification says contract construction is upstream.
+
+Raw one-second files containing `instrument_id` and symbols are useful provenance evidence, but they
+still do not prove which contract an upstream continuous series selected. Numeric IDs can be time-aware,
+and symbols may include calendar spreads. Negative spread prices must not be auto-repaired.
+
+The generic verifier supports an exact expected selection map, switch-policy callback, expiry metadata,
+or an explicitly supplied independent selector over raw per-contract bars. It never invents the selector.
+Without that policy/evidence, the result remains `ROLL PROVENANCE UNVERIFIED`.

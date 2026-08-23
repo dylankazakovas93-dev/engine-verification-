@@ -18,6 +18,7 @@ data/*
 # Generated reports/results
 reports/*
 !reports/.gitkeep
+!reports/*_manifest.json
 *.log
 
 # OS/editor

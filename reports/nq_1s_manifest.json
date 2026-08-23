@@ -1,0 +1,162 @@
+{
+  "path": "C:\\Users\\mikek\\downloads\\NQ.parquet",
+  "filename": "NQ.parquet",
+  "bytes": 2099660927,
+  "sha256": "f76cb2c5a1c9e4034fc1c8a1f23a490cc8a41c244d298bc2483a091fa8b924b0",
+  "format": "parquet",
+  "row_count": 142610981,
+  "first_timestamp": "2010-07-07T00:00:00+00:00",
+  "final_timestamp": "2026-08-06T23:59:58+00:00",
+  "timestamp_column": "ts_event",
+  "timezone_interpretation": "UTC (explicit in source schema)",
+  "schema": {
+    "ts_event": "timestamp[ns, tz=UTC]",
+    "rtype": "uint8",
+    "publisher_id": "uint16",
+    "instrument_id": "uint32",
+    "open": "double",
+    "high": "double",
+    "low": "double",
+    "close": "double",
+    "volume": "uint64",
+    "symbol": "string"
+  },
+  "chronological": true,
+  "duplicate_count": 0,
+  "malformed_row_count": 0,
+  "nonfinite_cell_count": 0,
+  "missing_interval_count": 3231766105,
+  "missing_interval_samples": [
+    {
+      "contract": "26715",
+      "after": "2010-07-07T00:00:00+00:00",
+      "before": "2010-07-07T00:00:02+00:00",
+      "missing_intervals": 1
+    },
+    {
+      "contract": "26715",
+      "after": "2010-07-07T00:00:02+00:00",
+      "before": "2010-07-07T00:00:05+00:00",
+      "missing_intervals": 2
+    },
+    {
+      "contract": "26715",
+      "after": "2010-07-07T00:00:05+00:00",
+      "before": "2010-07-07T00:00:49+00:00",
+      "missing_intervals": 43
+    },
+    {
+      "contract": "26715",
+      "after": "2010-07-07T00:00:49+00:00",
+      "before": "2010-07-07T00:01:08+00:00",
+      "missing_intervals": 18
+    },
+    {
+      "contract": "26715",
+      "after": "2010-07-07T00:01:08+00:00",
+      "before": "2010-07-07T00:03:46+00:00",
+      "missing_intervals": 157
+    },
+    {
+      "contract": "26715",
+      "after": "2010-07-07T00:03:46+00:00",
+      "before": "2010-07-07T00:03:52+00:00",
+      "missing_intervals": 5
+    },
+    {
+      "contract": "26715",
+      "after": "2010-07-07T00:03:52+00:00",
+      "before": "2010-07-07T00:04:12+00:00",
+      "missing_intervals": 19
+    },
+    {
+      "contract": "26715",
+      "after": "2010-07-07T00:04:12+00:00",
+      "before": "2010-07-07T00:04:20+00:00",
+      "missing_intervals": 7
+    },
+    {
+      "contract": "26715",
+      "after": "2010-07-07T00:04:21+00:00",
+      "before": "2010-07-07T00:04:23+00:00",
+      "missing_intervals": 1
+    },
+    {
+      "contract": "26715",
+      "after": "2010-07-07T00:04:23+00:00",
+      "before": "2010-07-07T00:04:28+00:00",
+      "missing_intervals": 4
+    },
+    {
+      "contract": "26715",
+      "after": "2010-07-07T00:04:28+00:00",
+      "before": "2010-07-07T00:04:34+00:00",
+      "missing_intervals": 5
+    },
+    {
+      "contract": "26715",
+      "after": "2010-07-07T00:04:34+00:00",
+      "before": "2010-07-07T00:04:37+00:00",
+      "missing_intervals": 2
+    },
+    {
+      "contract": "26715",
+      "after": "2010-07-07T00:04:37+00:00",
+      "before": "2010-07-07T00:04:45+00:00",
+      "missing_intervals": 7
+    },
+    {
+      "contract": "26715",
+      "after": "2010-07-07T00:04:45+00:00",
+      "before": "2010-07-07T00:04:49+00:00",
+      "missing_intervals": 3
+    },
+    {
+      "contract": "26715",
+      "after": "2010-07-07T00:04:49+00:00",
+      "before": "2010-07-07T00:04:56+00:00",
+      "missing_intervals": 6
+    },
+    {
+      "contract": "26715",
+      "after": "2010-07-07T00:04:57+00:00",
+      "before": "2010-07-07T00:05:01+00:00",
+      "missing_intervals": 3
+    },
+    {
+      "contract": "26715",
+      "after": "2010-07-07T00:05:01+00:00",
+      "before": "2010-07-07T00:05:04+00:00",
+      "missing_intervals": 2
+    },
+    {
+      "contract": "26715",
+      "after": "2010-07-07T00:05:04+00:00",
+      "before": "2010-07-07T00:05:25+00:00",
+      "missing_intervals": 20
+    },
+    {
+      "contract": "26715",
+      "after": "2010-07-07T00:05:25+00:00",
+      "before": "2010-07-07T00:05:28+00:00",
+      "missing_intervals": 2
+    },
+    {
+      "contract": "26715",
+      "after": "2010-07-07T00:05:28+00:00",
+      "before": "2010-07-07T00:05:32+00:00",
+      "missing_intervals": 3
+    }
+  ],
+  "contract_provenance_status": "RAW CONTRACT IDENTIFIERS/SYMBOLS PRESENT; CONTINUOUS ROLL SELECTION UNVERIFIED WITHOUT A FROZEN SELECTION POLICY/MAP",
+  "contract_columns": [
+    "instrument_id",
+    "symbol"
+  ],
+  "negative_price_rows": 648219,
+  "zero_volume_rows": 0,
+  "notes": [
+    "Nonpositive prices were classified, not treated as malformed; raw spread instruments can be negative.",
+    "71 instrument-to-symbol conflicts observed across streamed batches."
+  ]
+}

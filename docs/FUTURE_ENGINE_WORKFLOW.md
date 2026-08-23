@@ -19,6 +19,22 @@
 11. Audit contract provenance separately.
 12. Only then inspect PF/WR/equity curve.
 13. Any newly found bug becomes a permanent failing regression before patching.
+14. Run `python scripts/verify.py ...` and retain its JSON/Markdown artifacts.
+15. Inspect PF/WR only if every pre-performance mandatory gate is `PASS` and the machine verdict is `VERIFIED`.
+
+## Adapter stage interface
+
+`run(bars)` is mandatory. Expose `features`, `signals`, `eligible_signals`,
+`proposed_entries`, `accepted_entries`, and/or `audit_stages` when the candidate makes them
+available. Do not fabricate intermediate stages. Missing mandatory evidence is `UNVERIFIED`.
+
+## Causality modes
+
+- `fast`: bounded smoke coverage.
+- `standard`: distributed/warmup/session/event/random coverage.
+- `strong` (default): 28 deterministic cutoffs at every exposed stage.
+
+Every report records the exact cutoff timestamps, stages, and comparison counts.
 
 ## Verdict language
 
@@ -29,3 +45,5 @@ Use only:
 - UNVERIFIED: required evidence does not exist
 
 Never upgrade WARN/UNVERIFIED to PASS because results look plausible.
+
+Top-level exit codes: `0=VERIFIED`, `1=FAILED`, `2=INCOMPLETE / UNVERIFIED`.

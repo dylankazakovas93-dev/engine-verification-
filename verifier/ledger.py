@@ -11,15 +11,23 @@ def audit_ledger(
     *,
     strict_same_timestamp_reentry: bool = True,
     tick_size: float | None = None,
+    long_only: bool | None = None,
+    required_deadline: bool = False,
 ) -> list[Finding]:
     f: list[Finding]=[]
     req=["entry_time","exit_time","entry_price","exit_price"]
+    if required_deadline:
+        req.append("deadline")
+    if long_only is True:
+        req.append("direction")
     miss=[c for c in req if c not in trades.columns]
     if miss:
-        return [Finding("ledger_schema","FAIL",f"missing canonical columns: {miss}")]
+        return [Finding("ledger_schema","FAIL",f"missing canonical columns: {miss}",family="ledger")]
     f.append(Finding("ledger_schema","PASS","canonical entry/exit fields present"))
     if trades.empty:
         f.append(Finding("trade_count","INFO","0 accepted trades"))
+        for finding in f:
+            finding.family = finding.family or "ledger"
         return f
 
     t=trades.copy()
@@ -81,7 +89,9 @@ def audit_ledger(
                 bad=~np.isclose(x,np.round(x),rtol=0,atol=1e-9)
                 f.append(Finding(f"{c}_tick_alignment","FAIL" if bad.any() else "PASS",
                                  f"{int(bad.sum())} {c} values are off tick"))
-    if "direction" in t:
+    if "direction" in t and long_only is not False:
         bad=~t["direction"].astype(str).str.lower().isin(["long","1","buy"])
         f.append(Finding("long_only","FAIL" if bad.any() else "PASS",f"{int(bad.sum())} non-long trades"))
+    for finding in f:
+        finding.family = finding.family or "ledger"
     return f

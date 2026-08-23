@@ -40,11 +40,35 @@ A continuous OHLCV series **cannot prove its own rollover construction**. If the
 python -m pip install -e '.[test]'
 ```
 
-## One-command health check of this repository
+## Repository health
 
 ```bash
 python scripts/run_all.py
 ```
+
+## One-command engine verification
+
+```bash
+python scripts/verify.py \
+  --strategy nq_frozen_v1 \
+  --candidate strategies/nq_frozen_v1/adapter.py \
+  --source nq_frozen \
+  --data "D:\\market-data\\1Min_NQ.csv" \
+  --timestamp-col timestamp \
+  --high-res-data "C:\\Users\\me\\Downloads\\NQ.parquet" \
+  --high-res-timestamp-col ts_event \
+  --high-res-contract-col instrument_id \
+  --high-res-symbol-col symbol
+```
+
+The command runs configured health/data/source/ledger/causality/reference/provenance gates
+and writes durable JSON and Markdown reports under `reports/`. Exit codes are:
+
+- `0`: `VERIFIED`
+- `1`: `FAILED` (a reproducible mandatory violation)
+- `2`: `INCOMPLETE / UNVERIFIED` (required evidence is missing)
+
+An LLM must never translate exit code 2 into “everything passed.”
 
 ## Audit an arbitrary candidate engine
 
@@ -64,6 +88,15 @@ For a strategy with a reference engine, also run its strategy-specific reconcili
 python scripts/audit_data.py /path/to/1Min_NQ.csv
 ```
 
+CSV and Parquet are supported. A persistent streaming manifest can be written without modifying data:
+
+```bash
+python scripts/audit_data.py C:\\data\\NQ.parquet \
+  --timestamp-col ts_event --expected-interval 1s \
+  --contract-col instrument_id --symbol-col symbol \
+  --allow-nonpositive-prices --manifest-out reports/nq_1s_manifest.json
+```
+
 If the file has a contract column:
 
 ```bash
@@ -78,6 +111,32 @@ python verify_real_data.py /path/to/1Min_NQ.csv --timestamp-col timestamp
 ```
 
 Do not trust performance until the tests, generic audit, causality checks, and reference reconciliation all pass.
+
+## Causality adapter stages
+
+`run(bars)` is required. Adapters should expose as many independent stages as genuinely available:
+`features`, `signals`, `eligible_signals`, `proposed_entries`, `accepted_entries`, and `trades`.
+`audit_stages(bars)` can return all stages in one engine invocation. Strong mode uses distributed,
+warmup, event-adjacent, session-boundary, and fixed-seed random cutoffs for truncation and future mutation.
+
+A passing static AST/regex scan is only heuristic evidence; it does not prove no leakage.
+
+## New strategy workflow
+
+```text
+idea → frozen SPECIFICATION → numbered REQUIREMENTS → reviewed ORACLE
+→ deterministic tests → production engine → independent reference where required
+→ generic/strategy/data/causality reconciliation → machine verdict → performance
+```
+
+Create an isolated scaffold with `python scripts/new_strategy.py my_strategy`. Do not implement
+the engine until its specification and oracle are frozen.
+
+## Existing engine workflow
+
+Preserve the engine under `candidate_engines/`, hash and scan it, write only an adapter, audit
+the exact data, validate ledger/state/causality, then reconcile against a strategy oracle/reference.
+Every proven bug becomes a failing regression before the smallest patch.
 
 ## Change control
 

@@ -9,6 +9,9 @@ class Finding:
     status: str
     message: str
     rows: list[int] | None = None
+    family: str | None = None
+    classification: str | None = None
+    evidence: dict | None = None
 
     def to_dict(self):
         return asdict(self)
