@@ -1,0 +1,4 @@
+name = "strategy_name"
+version = "1.0"
+tick_size = 0.25
+strict_same_timestamp_reentry = true
