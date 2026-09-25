@@ -70,6 +70,19 @@ and writes durable JSON and Markdown reports under `reports/`. Exit codes are:
 
 An LLM must never translate exit code 2 into “everything passed.”
 
+## Research (ML / conditional-edge) verification
+
+Research engines use a separate, isolated verifier: adapter contract
+`events` / `features` / `targets` / `fit_predict_fold`, future-mutation causality, verifier-owned
+purged walk-forward folds, ML leakage poisoning and lockbox isolation. See
+`docs/RESEARCH_VERIFICATION.md` and `templates/research/adapter.py`.
+
+```bash
+python scripts/verify_research.py --adapter candidate_engines/research_adapter.py \
+  --data /path/to/bars.parquet --timestamp-col timestamp --target forward_return_60m \
+  --lockbox-start 2025-01-01 --mode strong
+```
+
 ## Audit an arbitrary candidate engine
 
 1. Put the engine anywhere under `candidate_engines/`.

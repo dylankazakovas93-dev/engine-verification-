@@ -70,6 +70,15 @@ python scripts/verify.py --strategy <name> --candidate <adapter.py> --data <cano
 This emits terminal output plus JSON and Markdown under `reports/`. Exit codes are
 `0=VERIFIED`, `1=FAILED`, and `2=INCOMPLETE / UNVERIFIED`.
 
+## Research / ML engines
+
+ML or conditional-edge research engines are verified with `scripts/verify_research.py`, not
+`scripts/verify.py`. Read `docs/RESEARCH_VERIFICATION.md` first. The verifier, never the candidate,
+builds purged walk-forward folds and controls the lockbox. Mandatory families: `research_contract`,
+`research_causality`, `walkforward`, `ml_leakage`, `lockbox`, `ml_static_scan` (plus
+`repository_health`, `data_audit`, `contract_provenance`). Never add a lockbox performance path.
+A research cheat found later becomes a new toy in `tests/research_toys.py` before any fix.
+
 ## Interpretation boundary
 
 Generic checks can prove structural errors. Strategy-specific correctness requires a strategy profile and oracle. Contract-roll correctness requires contract-selection provenance or raw contract evidence plus an explicit roll policy.
