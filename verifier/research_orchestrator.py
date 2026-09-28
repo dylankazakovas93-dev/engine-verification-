@@ -21,7 +21,8 @@ from .orchestrator import _pytest_finding, hash_source, load_candidate_bars
 from .report import VerificationReport
 from .research_causality import audit_research_causality
 from .research_contracts import (
-    FEATURE_KEYS, TARGET_KEYS, ResearchTables, audit_research_contract, load_research_adapter, select_target,
+    FEATURE_KEYS, TARGET_KEYS, ResearchTables, audit_research_contract, declared_resolution_times,
+    load_research_adapter, parse_bar_interval, parse_target_horizon, select_target,
 )
 from .schema import Finding
 from .static_scan import scan_source
@@ -45,7 +46,10 @@ class ResearchVerificationOptions:
     mode: str = "strong"
     seed: int = 1729
     contract_col: str | None = None
-    expected_interval: str | None = None
+    # Required (no usable default): bars are open-stamped and known at open + bar_interval.
+    bar_interval: str | None = None
+    # Externally declared maximum label horizon ("60bars" or "60min"); absent => coverage UNVERIFIED.
+    target_horizon: str | None = None
     min_train_events: int = 20
     run_tests: bool = True
     report_prefix: Path | None = None
@@ -71,17 +75,29 @@ def family_status(findings: list[Finding], families: tuple[str, ...] | frozenset
 
 def run_research_audit(
     adapter_factory: Callable[[], Any], bars: pd.DataFrame, *, target_name: str | None,
-    lockbox_start: pd.Timestamp | str | None, mode: str = "strong", seed: int = 1729,
+    lockbox_start: pd.Timestamp | str | None, bar_interval: pd.Timedelta | str,
+    target_horizon: str | None = None,
+    mode: str = "strong", seed: int = 1729,
     min_train_events: int = 20, cutoffs: list[pd.Timestamp] | None = None,
 ) -> tuple[list[Finding], dict[str, Any], dict[str, Any]]:
-    """Library entry point used by the CLI and the self-tests (no file IO)."""
+    """Library entry point used by the CLI and the self-tests (no file IO).
+
+    ``bar_interval`` is mandatory: a bar stamped ``s`` (its open) is known at ``s + bar_interval``.
+    """
+    bar_interval = parse_bar_interval(bar_interval)
     lockbox_ts = parse_lockbox_start(lockbox_start)
     coverage: dict[str, Any] = {}
-    artifacts: dict[str, Any] = {}
+    artifacts: dict[str, Any] = {"information_clock": {
+        "bar_timestamp": "bar open", "bar_interval": str(bar_interval),
+        "bar_known_at": f"open + {bar_interval}",
+    }}
 
     # 1. contract ------------------------------------------------------------------------
-    findings, tables, ready = audit_research_contract(adapter_factory, bars, target_name=target_name)
-    artifacts["research_readiness"] = dict(ready)
+    findings, tables, ready = audit_research_contract(
+        adapter_factory, bars, target_name=target_name, bar_interval=bar_interval, target_horizon=target_horizon,
+    )
+    eligible_ids = ready.pop("eligible_ids")
+    artifacts["research_readiness"] = {**ready, "eligible_event_count": len(eligible_ids)}
     if tables is None or tables.events is None or not ready["events_ok"]:
         why = "research contract did not yield a usable events table"
         findings += [_blocked("research_causality", "research_causality", why), _blocked("walkforward", "walkforward_folds", why),
@@ -95,15 +111,23 @@ def run_research_audit(
         tables.targets if tables.targets is not None and set(TARGET_KEYS).issubset(tables.targets.columns) else None,
     )
     causal_findings, causal_coverage = audit_research_causality(
-        adapter_factory, bars, causal_tables, mode=mode, seed=seed, cutoffs=cutoffs,
+        adapter_factory, bars, causal_tables, bar_interval=bar_interval, mode=mode, seed=seed, cutoffs=cutoffs,
     )
     findings += causal_findings
     coverage["research_causality"] = causal_coverage.to_dict()
 
     # 3. lockbox split -------------------------------------------------------------------
     model_ready = ready["features_ok"] and ready["targets_ok"] and ready["target_ok"]
+    # Declared-horizon resolution time per event (Nth window bar's open + bar_interval). Purge and
+    # lockbox use max(claimed target_end, declared resolution): an understated claim can never
+    # shorten a purge or let a label cross the lockbox. Causality keeps the CLAIMED target_end so
+    # that an understated claim is compared early and exposed.
+    horizon = parse_target_horizon(target_horizon)
+    declared_end = (declared_resolution_times(tables.events, bars.index, bar_interval, horizon)
+                    if horizon is not None else None)
     split = split_lockbox(tables.events, tables.features if ready["features_ok"] else None,
-                          tables.targets if ready["targets_ok"] else None, lockbox_ts)
+                          tables.targets if ready["targets_ok"] else None, lockbox_ts,
+                          resolution_times=declared_end.dropna() if declared_end is not None else None)
     artifacts["lockbox"] = split.counts()
     accessed: set | None = None
     if not model_ready:
@@ -119,6 +143,8 @@ def run_research_audit(
         selected = pd.DataFrame({"event_id": pd.Series([], dtype=object), "target_start": pd.Series(pd.DatetimeIndex([], tz="UTC")),
                                  "target_end": pd.Series(pd.DatetimeIndex([], tz="UTC")), "value": pd.Series([], dtype=float)})
     selected = selected[np.isfinite(selected["value"].to_numpy(float))]
+    # Modelling sample = verifier-determined eligibility (timestamp rule), never the candidate's choice.
+    selected = selected[selected["event_id"].isin(eligible_ids)]
     selected = selected[selected["event_id"].isin(set(split.features["event_id"].tolist()))].reset_index(drop=True)
     event_time = split.event_times
     observations = pd.DataFrame({
@@ -127,6 +153,9 @@ def run_research_audit(
         "target_start": selected["target_start"],
         "target_end": selected["target_end"],
     })
+    if declared_end is not None and not observations.empty:
+        declared = pd.Series(pd.to_datetime(declared_end.reindex(pd.Index(observations["event_id"].to_numpy(), dtype=object)), utc=True).array)
+        observations["target_end"] = pd.concat([pd.to_datetime(observations["target_end"], utc=True), declared], axis=1).max(axis=1)
     order = observations.assign(__id=observations["event_id"].astype(str)).sort_values(["event_time", "__id"], kind="mergesort").index
     observations = observations.loc[order].reset_index(drop=True)
     obs_ids = observations["event_id"].tolist()
@@ -140,7 +169,9 @@ def run_research_audit(
     findings += audit_folds(folds, observations, lockbox_start=lockbox_ts)
     coverage["walkforward"] = {
         "observations": len(observations), "folds": [f.to_dict() for f in folds], "skipped_blocks": skipped,
-        "block": "UTC calendar year", "purge_rule": "train iff event_time < validation_start and target_end < validation_start",
+        "block": "UTC calendar year",
+        "purge_rule": "train iff event_time < validation_start and resolution < validation_start, "
+                      "resolution = max(claimed target_end, declared horizon: Nth window bar open + bar_interval)",
     }
 
     # 5. ML leakage poisoning --------------------------------------------------------------
@@ -166,8 +197,10 @@ def run_research_audit(
 def verify_research(options: ResearchVerificationOptions) -> VerificationReport:
     root = Path(__file__).resolve().parents[1]
     adapter_path = options.adapter.resolve()
+    bar_interval = parse_bar_interval(options.bar_interval)  # raises before any work if undeclared
     findings: list[Finding] = []
     artifacts: dict[str, Any] = {"options": {
+        "bar_interval": str(bar_interval), "target_horizon": options.target_horizon,
         "target": options.target, "lockbox_start": options.lockbox_start, "mode": options.mode,
         "seed": options.seed, "min_train_events": options.min_train_events, "timestamp_col": options.timestamp_col,
     }}
@@ -195,7 +228,7 @@ def verify_research(options: ResearchVerificationOptions) -> VerificationReport:
     else:
         manifest, data_findings = audit_dataset(
             options.data, timestamp_col=options.timestamp_col,
-            expected_interval=options.expected_interval, contract_col=options.contract_col,
+            expected_interval=bar_interval, contract_col=options.contract_col,
         )
         findings += data_findings
         artifacts["data_manifest"] = manifest.to_dict()
@@ -207,7 +240,8 @@ def verify_research(options: ResearchVerificationOptions) -> VerificationReport:
                 bars = load_candidate_bars(options.data, options.timestamp_col)
                 research_findings, research_coverage, research_artifacts = run_research_audit(
                     lambda: load_research_adapter(adapter_path), bars,
-                    target_name=options.target, lockbox_start=options.lockbox_start,
+                    target_name=options.target, lockbox_start=options.lockbox_start, bar_interval=bar_interval,
+                    target_horizon=options.target_horizon,
                     mode=options.mode, seed=options.seed, min_train_events=options.min_train_events,
                 )
                 findings += research_findings

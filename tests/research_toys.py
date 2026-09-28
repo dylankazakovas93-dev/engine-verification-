@@ -3,6 +3,9 @@
 ``CleanToy`` is causal and respects the supplied folds. Every other class overrides exactly one
 behaviour of ``CleanToy`` to commit one specific, deliberate violation. A verifier that only
 passes clean code has not demonstrated anything; each cheat must be caught for its own reason.
+
+Information clock: a bar stamped ``s`` (its OPEN time) is fully known only at
+``s + bars.attrs["bar_interval"]``. The verifier supplies ``bar_interval``; toys never guess it.
 """
 from __future__ import annotations
 
@@ -13,29 +16,95 @@ from numpy.lib.stride_tricks import sliding_window_view
 HORIZON = 10
 TARGET = "forward_return_10"
 FEATURE_COLUMNS = ["ret_5", "vol_20", "dist_ma_20"]
+BAR = pd.Timedelta("1D")
+HORIZON_SPEC = f"{HORIZON}bars"  # declared externally by the test, exactly as the CLI's --target-horizon
 
 
 def make_bars(start: str = "2015-01-01", end: str = "2020-12-31", seed: int = 7) -> pd.DataFrame:
-    """Deterministic daily-close bars (21:00 UTC business days) with valid OHLC geometry."""
+    """Deterministic daily bars (open-stamped 21:00 UTC business days) with valid OHLC geometry."""
     index = pd.bdate_range(start, end, tz="UTC") + pd.Timedelta(hours=21)
     rng = np.random.default_rng(seed)
     close = 100.0 * np.exp(np.cumsum(rng.normal(0.0003, 0.01, len(index))))
     open_ = np.r_[close[0], close[:-1]]
-    return pd.DataFrame({
+    bars = pd.DataFrame({
         "open": open_, "high": np.maximum(open_, close) * 1.002, "low": np.minimum(open_, close) * 0.998,
         "close": close, "volume": np.ones(len(index)),
     }, index=index)
+    bars.attrs["bar_interval"] = BAR
+    return bars
 
 
-def _event_frame(bars: pd.DataFrame, mask: np.ndarray) -> pd.DataFrame:
+def interval(bars: pd.DataFrame) -> pd.Timedelta:
+    value = bars.attrs.get("bar_interval")
+    if value is None:
+        raise ValueError("bars.attrs['bar_interval'] missing: the verifier must declare bar availability")
+    return pd.Timedelta(value)
+
+
+def _events(bars: pd.DataFrame, mask: np.ndarray, lag: pd.Timedelta) -> pd.DataFrame:
+    """Events on masked bars; event_time = bar open + lag (lag = bar_interval is the legal choice)."""
     close = bars["close"]
     ma = close.rolling(20).mean()
     times = bars.index[mask]
     return pd.DataFrame({
         "event_id": [f"E{t:%Y%m%dT%H%M}" for t in times],
-        "event_time": pd.Series(times),
+        "event_time": pd.Series(times + lag),
         "direction": np.where(close.to_numpy()[mask] >= ma.to_numpy()[mask], "long", "short"),
     })
+
+
+def _signal_positions(bars: pd.DataFrame, events: pd.DataFrame, lag: pd.Timedelta) -> np.ndarray:
+    return bars.index.get_indexer(pd.DatetimeIndex(events["event_time"]) - lag)
+
+
+def _feature_table(bars: pd.DataFrame) -> pd.DataFrame:
+    close = bars["close"]
+    return pd.DataFrame({
+        "ret_5": close / close.shift(5) - 1.0,
+        "vol_20": close.pct_change().rolling(20).std(),
+        "dist_ma_20": close / close.rolling(20).mean() - 1.0,
+    }, index=bars.index)
+
+
+def _features(bars: pd.DataFrame, events: pd.DataFrame, lag: pd.Timedelta) -> pd.DataFrame:
+    rows = _feature_table(bars).iloc[_signal_positions(bars, events, lag)]
+    out = pd.DataFrame({"event_id": events["event_id"].to_numpy(), "feature_asof_time": events["event_time"].reset_index(drop=True)})
+    for column in FEATURE_COLUMNS:
+        out[column] = rows[column].to_numpy()
+    return out
+
+
+def _empty_targets() -> pd.DataFrame:
+    return pd.DataFrame({
+        "event_id": pd.Series([], dtype=object),
+        "target_start": pd.Series(pd.DatetimeIndex([], tz="UTC")),
+        "target_end": pd.Series(pd.DatetimeIndex([], tz="UTC")),
+        TARGET: pd.Series([], dtype=float), "mfe_10": pd.Series([], dtype=float),
+    })
+
+
+def _targets(bars: pd.DataFrame, events: pd.DataFrame, lag: pd.Timedelta, end_lag: pd.Timedelta) -> pd.DataFrame:
+    """Forward window = bars p+1..p+H (all opening at/after the event). Resolved at open(p+H)+end_lag."""
+    close = bars["close"].to_numpy(float)
+    high = bars["high"].to_numpy(float)
+    position = _signal_positions(bars, events, lag)
+    ok = position + HORIZON < len(bars)
+    p = position[ok]
+    if len(p) == 0:  # prefix too short to resolve any label: emit an empty, well-typed table
+        return _empty_targets()
+    windows = sliding_window_view(high, HORIZON)
+    return pd.DataFrame({
+        "event_id": events["event_id"].to_numpy()[ok],
+        "target_start": pd.Series(bars.index[p + 1]),
+        "target_end": pd.Series(bars.index[p + HORIZON] + end_lag),
+        TARGET: close[p + HORIZON] / close[p] - 1.0,
+        "mfe_10": windows[p + 1].max(axis=1) / close[p] - 1.0,
+    })
+
+
+def _base_mask(bars: pd.DataFrame) -> np.ndarray:
+    position = np.arange(len(bars))
+    return (position >= 20) & (position % 3 == 0)
 
 
 def _ridge_fit_predict(train_x: pd.DataFrame, train_y: pd.Series, predict_x: pd.DataFrame, ridge: float = 1.0,
@@ -54,50 +123,19 @@ def _ridge_fit_predict(train_x: pd.DataFrame, train_y: pd.Series, predict_x: pd.
 
 
 class CleanToy:
-    """Causal events/features/targets and a ridge model fitted on train_ids only."""
+    """Causal events/features/targets on the availability clock and a ridge fitted on train_ids only."""
 
     @staticmethod
     def events(bars: pd.DataFrame) -> pd.DataFrame:
-        position = np.arange(len(bars))
-        return _event_frame(bars, (position >= 20) & (position % 3 == 0))
+        return _events(bars, _base_mask(bars), interval(bars))
 
     @staticmethod
     def features(bars: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
-        close = bars["close"]
-        returns = close.pct_change()
-        table = pd.DataFrame({
-            "ret_5": close / close.shift(5) - 1.0,
-            "vol_20": returns.rolling(20).std(),
-            "dist_ma_20": close / close.rolling(20).mean() - 1.0,
-        }, index=bars.index)
-        rows = table.reindex(pd.DatetimeIndex(events["event_time"]))
-        out = pd.DataFrame({"event_id": events["event_id"].to_numpy(), "feature_asof_time": events["event_time"].reset_index(drop=True)})
-        for column in FEATURE_COLUMNS:
-            out[column] = rows[column].to_numpy()
-        return out
+        return _features(bars, events, interval(bars))
 
     @staticmethod
     def targets(bars: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
-        close = bars["close"].to_numpy(float)
-        high = bars["high"].to_numpy(float)
-        position = bars.index.get_indexer(pd.DatetimeIndex(events["event_time"]))
-        ok = position + HORIZON < len(bars)
-        p = position[ok]
-        if len(p) == 0:  # prefix too short to resolve any label: emit an empty, well-typed table
-            return pd.DataFrame({
-                "event_id": pd.Series([], dtype=object),
-                "target_start": pd.Series(pd.DatetimeIndex([], tz="UTC")),
-                "target_end": pd.Series(pd.DatetimeIndex([], tz="UTC")),
-                TARGET: pd.Series([], dtype=float), "mfe_10": pd.Series([], dtype=float),
-            })
-        windows = sliding_window_view(high, HORIZON)
-        return pd.DataFrame({
-            "event_id": events["event_id"].to_numpy()[ok],
-            "target_start": pd.Series(bars.index[p + 1]),
-            "target_end": pd.Series(bars.index[p + HORIZON]),
-            TARGET: close[p + HORIZON] / close[p] - 1.0,
-            "mfe_10": windows[p + 1].max(axis=1) / close[p] - 1.0,
-        })
+        return _targets(bars, events, interval(bars), interval(bars))
 
     @staticmethod
     def fit_predict_fold(features, targets, train_ids, validation_ids, target_name):
@@ -105,6 +143,108 @@ class CleanToy:
         y = targets.set_index("event_id")[target_name]
         prediction = _ridge_fit_predict(x.loc[train_ids], y.loc[train_ids], x.loc[validation_ids])
         return pd.DataFrame({"event_id": list(validation_ids), "prediction": prediction})
+
+
+# --------------------------------------------------------------------------------------
+# Bar-availability cheats
+# --------------------------------------------------------------------------------------
+class EventAtBarStart(CleanToy):
+    """Uses the event bar's CLOSE but stamps the event at the bar's OPEN (the 09:30-bar problem).
+    Features and targets are internally consistent with that wrong clock."""
+
+    @staticmethod
+    def events(bars):
+        return _events(bars, _base_mask(bars), pd.Timedelta(0))
+
+    @staticmethod
+    def features(bars, events):
+        return _features(bars, events, pd.Timedelta(0))
+
+    @staticmethod
+    def targets(bars, events):
+        return _targets(bars, events, pd.Timedelta(0), interval(bars))
+
+
+class TargetEndAtBarStart(CleanToy):
+    """Declares the label resolved at the OPEN of its last bar, although it uses that bar's close."""
+
+    @staticmethod
+    def targets(bars, events):
+        return _targets(bars, events, interval(bars), pd.Timedelta(0))
+
+
+class TargetEndAtFinalBarOpen(CleanToy):
+    """Uses the Nth (final) window bar's close, high and low, but declares target_end equal to that
+    bar's OPEN timestamp instead of its availability time (open + bar_interval)."""
+
+    @staticmethod
+    def targets(bars, events):
+        close, high, low = (bars[c].to_numpy(float) for c in ("close", "high", "low"))
+        position = _signal_positions(bars, events, interval(bars))
+        ok = position + HORIZON < len(bars)
+        p = position[ok]
+        final = p + HORIZON
+        return pd.DataFrame({
+            "event_id": events["event_id"].to_numpy()[ok],
+            "target_start": events["event_time"].iloc[np.flatnonzero(ok)].reset_index(drop=True),  # = T
+            "target_end": pd.Series(bars.index[final]),  # WRONG: bar open, not open + interval
+            TARGET: close[final] / close[p] - 1.0,
+            "mfe_10": high[final] / close[p] - 1.0,
+            "mae_10": low[final] / close[p] - 1.0,
+        })
+
+
+class TargetStartsOnSignalBar(CleanToy):
+    """Forward window (MFE) includes the signal bar itself, i.e. price movement before the event."""
+
+    @staticmethod
+    def targets(bars, events):
+        out = CleanToy.targets(bars, events)
+        position = _signal_positions(bars, events.set_index("event_id").loc[out["event_id"]].reset_index(), interval(bars))
+        close, high = bars["close"].to_numpy(float), bars["high"].to_numpy(float)
+        out["target_start"] = pd.Series(bars.index[position])
+        out["mfe_10"] = sliding_window_view(high, HORIZON)[position].max(axis=1) / close[position] - 1.0
+        return out
+
+
+# --------------------------------------------------------------------------------------
+# Outcome-dependent sample selection cheats
+# --------------------------------------------------------------------------------------
+class OutcomeSelectedTargets(CleanToy):
+    """Emits labels only for events whose forward return turned out positive."""
+
+    @staticmethod
+    def targets(bars, events):
+        out = CleanToy.targets(bars, events)
+        return out[out[TARGET] > 0].reset_index(drop=True)
+
+
+class TargetBeyondDeclaredHorizon(CleanToy):
+    """Labels use an 11-bar window while the frozen declaration is 10 bars."""
+
+    @staticmethod
+    def targets(bars, events):
+        close = bars["close"].to_numpy(float)
+        position = _signal_positions(bars, events, interval(bars))
+        ok = position + HORIZON + 1 < len(bars)
+        p = position[ok]
+        return pd.DataFrame({
+            "event_id": events["event_id"].to_numpy()[ok],
+            "target_start": pd.Series(bars.index[p + 1]),
+            "target_end": pd.Series(bars.index[p + HORIZON + 1] + interval(bars)),
+            TARGET: close[p + HORIZON + 1] / close[p] - 1.0,
+            "mfe_10": np.zeros(len(p)),
+        })
+
+
+class OutcomeNaNTargets(CleanToy):
+    """Blanks the label (NaN) for events whose forward return turned out negative."""
+
+    @staticmethod
+    def targets(bars, events):
+        out = CleanToy.targets(bars, events)
+        out.loc[out[TARGET] < 0, TARGET] = np.nan
+        return out
 
 
 # --------------------------------------------------------------------------------------
@@ -116,19 +256,18 @@ class GlobalMeanFeature(CleanToy):
     @staticmethod
     def features(bars, events):
         out = CleanToy.features(bars, events)
-        normalized = (bars["close"] / bars["close"].mean()).reindex(pd.DatetimeIndex(events["event_time"]))
-        out["close_norm"] = normalized.to_numpy()
+        normalized = (bars["close"] / bars["close"].mean()).to_numpy()
+        out["close_norm"] = normalized[_signal_positions(bars, events, interval(bars))]
         return out
 
 
 class OneBarLookaheadEvents(CleanToy):
-    """An event at t exists only if close[t+1] > close[t]."""
+    """An event on bar t exists only if close[t+1] > close[t]."""
 
     @staticmethod
     def events(bars):
-        position = np.arange(len(bars))
         next_up = (bars["close"].shift(-1) > bars["close"]).to_numpy()
-        return _event_frame(bars, (position >= 20) & (position % 3 == 0) & next_up)
+        return _events(bars, _base_mask(bars) & next_up, interval(bars))
 
 
 class TargetCopiedNamed(CleanToy):
@@ -154,16 +293,15 @@ class TargetCopiedDisguised(CleanToy):
 
 
 class TargetPeeksBeyondEnd(CleanToy):
-    """Declares target_end = t+10 but the label uses close[t+11]."""
+    """Declares the window ends with bar t+10 but the label uses close[t+11]."""
 
     @staticmethod
     def targets(bars, events):
         out = CleanToy.targets(bars, events)
-        close = bars["close"]
-        start = pd.DatetimeIndex(events.set_index("event_id").loc[out["event_id"], "event_time"])
-        position = bars.index.get_indexer(start)
+        close = bars["close"].to_numpy()
+        position = _signal_positions(bars, events.set_index("event_id").loc[out["event_id"]].reset_index(), interval(bars))
         peek = np.minimum(position + HORIZON + 1, len(bars) - 1)
-        out[TARGET] = close.to_numpy()[peek] / close.to_numpy()[position] - 1.0
+        out[TARGET] = close[peek] / close[position] - 1.0
         return out
 
 
@@ -173,8 +311,8 @@ class FeatureAsofLies(CleanToy):
     @staticmethod
     def features(bars, events):
         out = CleanToy.features(bars, events)
-        position = bars.index.get_indexer(pd.DatetimeIndex(events["event_time"]))
-        out["feature_asof_time"] = pd.Series(bars.index[np.maximum(position - 5, 0)])
+        position = _signal_positions(bars, events, interval(bars))
+        out["feature_asof_time"] = pd.Series(bars.index[np.maximum(position - 5, 0)] + interval(bars))
         return out
 
 
@@ -184,8 +322,7 @@ class FeatureAsofAfterEvent(CleanToy):
     @staticmethod
     def features(bars, events):
         out = CleanToy.features(bars, events)
-        position = bars.index.get_indexer(pd.DatetimeIndex(events["event_time"]))
-        out["feature_asof_time"] = pd.Series(bars.index[np.minimum(position + 1, len(bars) - 1)])
+        out["feature_asof_time"] = events["event_time"].reset_index(drop=True) + interval(bars)
         return out
 
 
@@ -315,14 +452,17 @@ LOCKBOX = "2020-01-01"
 _CACHE: dict = {}
 
 
-def audit(name: str, mode: str = "fast", lockbox: str | None = LOCKBOX):
-    """Run the full research audit on toy ``name`` once per (name, mode, lockbox)."""
+def audit(name: str, mode: str = "fast", lockbox: str | None = LOCKBOX, horizon: str | None = HORIZON_SPEC):
+    """Run the full research audit on toy ``name`` once per (name, mode, lockbox, horizon)."""
     from verifier.research_orchestrator import run_research_audit
 
-    key = (name, mode, lockbox)
+    key = (name, mode, lockbox, horizon)
     if key not in _CACHE:
         toy = globals()[name]
-        _CACHE[key] = run_research_audit(lambda: toy, make_bars(), target_name=TARGET, lockbox_start=lockbox, mode=mode)
+        _CACHE[key] = run_research_audit(
+            lambda: toy, make_bars(), target_name=TARGET, lockbox_start=lockbox, mode=mode, bar_interval=BAR,
+            target_horizon=horizon,
+        )
     return _CACHE[key]
 
 

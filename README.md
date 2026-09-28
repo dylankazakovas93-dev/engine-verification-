@@ -79,7 +79,7 @@ purged walk-forward folds, ML leakage poisoning and lockbox isolation. See
 
 ```bash
 python scripts/verify_research.py --adapter candidate_engines/research_adapter.py \
-  --data /path/to/bars.parquet --timestamp-col timestamp --target forward_return_60m \
+  --data /path/to/bars.parquet --timestamp-col timestamp --bar-interval 1min --target forward_return_60m --target-horizon 60bars \
   --lockbox-start 2025-01-01 --mode strong
 ```
 

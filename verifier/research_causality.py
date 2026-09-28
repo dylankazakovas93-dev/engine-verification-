@@ -29,7 +29,9 @@ import numpy as np
 import pandas as pd
 
 from .causality import _equal, generate_cutoffs, mutate_future
-from .research_contracts import TARGET_NAME_COL, ResearchTables, run_pipeline, to_utc
+from .research_contracts import (
+    TARGET_NAME_COL, ResearchTables, information_index, parse_bar_interval, run_pipeline, to_utc,
+)
 from .schema import Finding
 
 FAMILY = "research_causality"
@@ -145,11 +147,13 @@ def _adjacent_cutoffs(index: pd.DatetimeIndex, times: pd.Series, count: int) -> 
 
 
 def generate_research_cutoffs(
-    bars: pd.DataFrame, tables: ResearchTables, *, mode: str = "strong", seed: int = 1729,
-    explicit: list[pd.Timestamp] | None = None,
+    bars: pd.DataFrame, tables: ResearchTables, *, bar_interval: pd.Timedelta, mode: str = "strong",
+    seed: int = 1729, explicit: list[pd.Timestamp] | None = None,
 ) -> list[pd.Timestamp]:
+    """Cutoffs on the INFORMATION clock (bar open + bar_interval), never on raw bar-open stamps."""
     if explicit is not None:
         return sorted({pd.Timestamp(x).tz_convert("UTC") for x in explicit})
+    bars = bars.set_axis(information_index(bars, bar_interval), axis=0)
     # Map research tables onto the frozen harness stage names so its cutoff logic is reused as-is.
     proxy: dict[str, pd.DataFrame] = {}
     if tables.events is not None and "event_time" in tables.events:
@@ -187,9 +191,18 @@ def _build_comparisons(
 
 def audit_research_causality(
     adapter_factory: Callable[[], Any], bars: pd.DataFrame, full: ResearchTables, *,
-    mode: str = "strong", seed: int = 1729, cutoffs: list[pd.Timestamp] | None = None, atol: float = 1e-9,
+    bar_interval: pd.Timedelta | str, mode: str = "strong", seed: int = 1729,
+    cutoffs: list[pd.Timestamp] | None = None, atol: float = 1e-9,
 ) -> tuple[list[Finding], ResearchCausalityCoverage]:
-    """Compare full / truncated / future-mutated research tables at many cutoffs."""
+    """Compare full / truncated / future-mutated research tables at many cutoffs.
+
+    For cutoff ``T`` on the information clock: the truncated run keeps bars known strictly before
+    ``T`` (``open + bar_interval < T``); the mutated run mutates every bar known at/after ``T``
+    (``mutate_future(bars, T - bar_interval)``, i.e. ``open >= T - bar_interval``). An event
+    stamped at a bar's open while using that bar's close is therefore compared at a cutoff where
+    the bar is absent/mutated, and fails.
+    """
+    bar_interval = parse_bar_interval(bar_interval)
     coverage = ResearchCausalityCoverage(mode, seed)
     if not isinstance(bars.index, pd.DatetimeIndex) or bars.index.tz is None:
         return [_f("research_causality", "FAIL", "bars must have a timezone-aware DatetimeIndex", classification=PROVEN)], coverage
@@ -197,7 +210,8 @@ def audit_research_causality(
         return [_f("research_causality", "UNVERIFIED", "adapter exposes no events(); research causality cannot be evaluated")], coverage
     exposed = {"events": True, "features": full.features is not None, "features_asof": full.features is not None,
                "targets": full.targets is not None}
-    chosen = generate_research_cutoffs(bars, full, mode=mode, seed=seed, explicit=cutoffs)
+    chosen = generate_research_cutoffs(bars, full, bar_interval=bar_interval, mode=mode, seed=seed, explicit=cutoffs)
+    known_at = information_index(bars, bar_interval)
     coverage.cutoffs = tuple(c.isoformat() for c in chosen)
     findings: list[Finding] = []
     if not chosen:
@@ -207,9 +221,13 @@ def audit_research_causality(
                 for stage in STAGES for kind in ("truncation", "future_mutation")}
     for cutoff in chosen:
         runs: dict[str, ResearchTables] = {}
-        for kind, frame in (("truncation", bars[bars.index < cutoff]), ("future_mutation", mutate_future(bars, cutoff))):
+        variants = (
+            ("truncation", bars[known_at < cutoff]),
+            ("future_mutation", mutate_future(bars, cutoff - bar_interval)),
+        )
+        for kind, frame in variants:
             try:
-                runs[kind] = run_pipeline(adapter_factory(), frame)
+                runs[kind] = run_pipeline(adapter_factory(), frame, bar_interval)
             except Exception as exc:
                 coverage.execution_errors += 1
                 findings.append(_f(

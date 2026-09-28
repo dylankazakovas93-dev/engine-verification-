@@ -109,6 +109,7 @@ def test_model_never_receives_lockbox_rows():
     T.RecordingModel.seen = set()
     findings, _, artifacts = run_research_audit(
         lambda: T.RecordingModel, T.make_bars(), target_name=T.TARGET, lockbox_start=T.LOCKBOX, mode="fast",
+        bar_interval=T.BAR,
     )
     bars = T.make_bars()
     events = T.CleanToy.events(bars)
@@ -129,6 +130,26 @@ def test_boundary_crossing_labels_are_withheld():
     assert split.boundary_ids
     assert not set(split.boundary_ids) & set(split.targets["event_id"])
     assert (split.targets["target_end"] < parse_lockbox_start(T.LOCKBOX)).all()
+
+
+def test_lockbox_boundary_uses_declared_resolution_not_understated_claim():
+    from verifier.research_contracts import TargetHorizon, declared_resolution_times
+    bars = T.make_bars()
+    events = T.TargetEndAtFinalBarOpen.events(bars)
+    targets = T.TargetEndAtFinalBarOpen.targets(bars, events)  # claims one bar early
+    lockbox = parse_lockbox_start(T.LOCKBOX)
+    claimed_only = split_lockbox(events, None, targets, lockbox)
+    declared = declared_resolution_times(events, bars.index, T.BAR, TargetHorizon(bars=T.HORIZON)).dropna()
+    widened = split_lockbox(events, None, targets, lockbox, resolution_times=declared)
+    assert set(claimed_only.boundary_ids) <= set(widened.boundary_ids)
+    assert (declared.reindex(pd.Index(widened.development_ids, dtype=object)).dropna() < lockbox).all()
+
+
+def test_purge_uses_declared_resolution_not_understated_claim():
+    clean = T.audit("CleanToy")[1]["walkforward"]["folds"]
+    understated = T.audit("TargetEndAtFinalBarOpen")[1]["walkforward"]["folds"]
+    assert [f["purged_count"] for f in understated] == [f["purged_count"] for f in clean]
+    assert [f["train_count"] for f in understated] == [f["train_count"] for f in clean]
 
 
 def test_guard_refuses_lockbox_rows():

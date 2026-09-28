@@ -10,10 +10,45 @@ from verifier.research_contracts import run_pipeline
 FAMILY = "research_causality"
 
 
+def test_regression_target_end_declared_at_final_bar_open_fails():
+    """REGRESSION: a label built from the final window bar's close/high/low must declare
+    target_end = that bar's open + bar_interval. Declaring the bar's OPEN claims resolution one bar
+    early; the verifier must compare it at a cutoff where that bar is incomplete and FAIL."""
+    findings, _ = _run(T.TargetEndAtFinalBarOpen)
+    failing = [f for f in findings if f.status == "FAIL" and f.check in {"truncation_targets", "future_mutation_targets"}]
+    assert {f.check for f in failing} == {"truncation_targets", "future_mutation_targets"}
+    # The failure happens exactly inside the one-bar window between the claimed and true resolution.
+    bars = T.make_bars()
+    claimed = set(bars.index)  # claimed ends are bar opens
+    cutoffs = {pd.Timestamp(f.evidence["cutoff"]) for f in failing}
+    assert any((c - T.BAR) in claimed for c in cutoffs)
+    # Contract checks alone cannot see it (the claim is earlier than the declared horizon); it is a
+    # dynamic, proven causality failure.
+    contract, _, _ = T.audit("TargetEndAtFinalBarOpen")
+    assert not T.failing_checks(contract, "research_contract")
+    assert T.failing_checks(contract, FAMILY) >= {"truncation_targets", "future_mutation_targets"}
+
+
+def test_declared_resolution_time_is_nth_bar_open_plus_interval_with_gaps():
+    from verifier.research_contracts import TargetHorizon, declared_resolution_times
+    minute = pd.Timedelta("1min")
+    opens = pd.date_range("2024-01-02 09:30", periods=120, freq="1min", tz="UTC")
+    opens = opens.delete(opens.get_loc(pd.Timestamp("2024-01-02 10:00", tz="UTC")))  # one missing source bar
+    events = pd.DataFrame({"event_id": ["a", "b"], "event_time": pd.to_datetime(
+        ["2024-01-02 09:31", "2024-01-02 11:00"], utc=True)})
+    ends = declared_resolution_times(events, opens, minute, TargetHorizon(bars=60))
+    # 60 available bars opening at/after 09:31 with 10:00 missing: last opens at 10:31 -> resolved 10:32.
+    assert ends["a"] == pd.Timestamp("2024-01-02 10:32", tz="UTC")
+    assert pd.isna(ends["b"])  # fewer than 60 bars after 11:00 in the data -> unresolvable tail
+    contiguous = pd.date_range("2024-01-02 09:30", periods=120, freq="1min", tz="UTC")
+    assert declared_resolution_times(events.iloc[:1], contiguous, minute, TargetHorizon(bars=60))["a"] == \
+        pd.Timestamp("2024-01-02 10:31", tz="UTC")  # final included bar opens 10:30 -> resolved 10:31
+
+
 def _run(toy, mode="fast", cutoffs=None):
     bars = T.make_bars()
-    full = run_pipeline(toy, bars)
-    return audit_research_causality(lambda: toy, bars, full, mode=mode, cutoffs=cutoffs)
+    full = run_pipeline(toy, bars, T.BAR)
+    return audit_research_causality(lambda: toy, bars, full, bar_interval=T.BAR, mode=mode, cutoffs=cutoffs)
 
 
 def test_reuses_existing_mutation_and_cutoff_primitives():
@@ -34,14 +69,45 @@ def test_clean_toy_is_invariant_at_every_strong_cutoff():
         assert cov["failures"][key] == 0
 
 
-def test_research_cutoffs_include_bar_immediately_after_events_and_target_ends():
+def test_research_cutoffs_are_on_the_information_clock_right_after_events_and_target_ends():
     bars = T.make_bars()
-    full = run_pipeline(T.CleanToy, bars)
-    chosen = set(generate_research_cutoffs(bars, full, mode="strong"))
+    full = run_pipeline(T.CleanToy, bars, T.BAR)
+    chosen = set(generate_research_cutoffs(bars, full, bar_interval=T.BAR, mode="strong"))
+    known = bars.index + T.BAR
+    assert chosen <= set(known)  # every generated cutoff is a bar-completion time
     first_event = full.events["event_time"].iloc[0]
     first_target_end = full.targets["target_end"].min()
-    assert bars.index[bars.index.searchsorted(first_event, side="right")] in chosen
-    assert bars.index[bars.index.searchsorted(first_target_end, side="right")] in chosen
+    assert known[known.searchsorted(first_event, side="right")] in chosen
+    assert known[known.searchsorted(first_target_end, side="right")] in chosen
+
+
+def test_event_stamped_at_bar_open_but_using_its_close_fails():
+    """The 09:30-bar problem: close is used, but the event claims to be known at the open."""
+    findings, _ = _run(T.EventAtBarStart)
+    failing = T.failing_checks(findings, FAMILY)
+    assert {"truncation_events", "truncation_features"} <= failing
+
+
+def test_same_cheat_passed_under_the_old_bar_open_clock():
+    """Documents WHY the clock matters: with truncation on raw open stamps (the pre-fix
+    behaviour, reproduced here with an explicit bar-open cutoff grid) the cheat was invisible."""
+    bars = T.make_bars()
+    toy = T.EventAtBarStart
+    full = run_pipeline(toy, bars, T.BAR)
+    open_grid = list(bars.index[25:1500:37])
+    old = []
+    for cutoff in open_grid:
+        prefix = run_pipeline(toy, bars[bars.index < cutoff], T.BAR)
+        old.append(research_causality._equal(
+            research_causality.events_before(full.events, cutoff), research_causality.events_before(prefix.events, cutoff))[0])
+    assert all(old)
+    findings, _ = _run(toy, cutoffs=open_grid)  # same cutoffs, information-clock truncation
+    assert "truncation_events" in T.failing_checks(findings, FAMILY)
+
+
+def test_target_claiming_resolution_at_last_bar_open_fails():
+    findings, _ = _run(T.TargetEndAtBarStart)
+    assert {"truncation_targets", "future_mutation_targets"} <= T.failing_checks(findings, FAMILY)
 
 
 def test_full_sample_mean_feature_fails_future_mutation_and_truncation():

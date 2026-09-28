@@ -170,7 +170,6 @@ def generate_cutoffs(
         (normalized[1:] != normalized[:-1]) | np.isin(bars.index[1:].hour, [0, 4, 8, 12, 15, 16, 18, 20])
     ) + 1
     positions.update(int(x) for x in transition[:12] if x < n)
-    index_ns = bars.index.asi8
     for stage, frame in full_stages.items():
         time_col = _time_column(frame, stage)
         if frame.empty or time_col is None:
@@ -179,7 +178,7 @@ def generate_cutoffs(
         if len(times) > 8:
             times = times.iloc[np.linspace(0, len(times) - 1, 8, dtype=int)]
         for ts in times:
-            pos = int(np.searchsorted(index_ns, ts.value, side="right"))
+            pos = int(bars.index.searchsorted(ts, side="right"))
             if 0 < pos < n:
                 positions.add(pos)
     ordered = sorted(positions)

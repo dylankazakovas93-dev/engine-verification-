@@ -23,11 +23,20 @@ def main() -> None:
     parser.add_argument("--data", default=None, help="canonical CSV or Parquet bars")
     parser.add_argument("--timestamp-col", default="timestamp")
     parser.add_argument("--target", default=None, help="target name (wide column or long-format target_name)")
+    parser.add_argument(
+        "--target-horizon", default=None,
+        help="externally declared MAXIMUM label horizon: '60bars' (first 60 bars opening at/after the event) or a "
+             "wall-clock duration such as '60min'. Required for label-coverage proof; absent => UNVERIFIED.",
+    )
     parser.add_argument("--lockbox-start", default=None, help="YYYY-MM-DD (UTC); rows at/after are withheld from modelling")
     parser.add_argument("--mode", choices=["fast", "standard", "strong"], default="strong")
     parser.add_argument("--seed", type=int, default=1729)
     parser.add_argument("--contract-col", default=None)
-    parser.add_argument("--expected-interval", default=None, help="e.g. 1min; enables missing-interval counting in the data audit")
+    parser.add_argument(
+        "--bar-interval", required=True,
+        help="bar duration, e.g. 1min or 1s. Bars are OPEN-stamped; a bar stamped s is known at s + bar-interval. "
+             "Also used for missing-interval counting in the data audit.",
+    )
     parser.add_argument("--min-train-events", type=int, default=20)
     parser.add_argument("--skip-tests", action="store_true")
     parser.add_argument("--report-prefix", default=None)
@@ -40,7 +49,7 @@ def main() -> None:
         source=Path(args.source).resolve() if args.source else None,
         timestamp_col=args.timestamp_col, target=args.target, lockbox_start=args.lockbox_start,
         mode=args.mode, seed=args.seed, contract_col=args.contract_col,
-        expected_interval=args.expected_interval, min_train_events=args.min_train_events,
+        bar_interval=args.bar_interval, target_horizon=args.target_horizon, min_train_events=args.min_train_events,
         run_tests=not args.skip_tests, report_prefix=prefix,
     ))
     status = report.artifacts.get("family_status", {})

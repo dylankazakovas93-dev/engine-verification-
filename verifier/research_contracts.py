@@ -12,8 +12,11 @@ Research adapter contract (see ``docs/RESEARCH_VERIFICATION.md``)::
     fit_predict_fold(features, targets, train_ids, validation_ids, target_name)
         -> DataFrame[event_id, prediction]          # optional; absent => ml_leakage UNVERIFIED
 
-Clock convention: a bar row stamped ``t`` is treated as known at ``t`` (identical to the
-existing truncation/mutation harness, which keeps rows ``index < cutoff``).
+Information clock (explicit, never inferred): bars are stamped at their OPEN. A bar stamped
+``s`` is fully known (high/low/close/volume) only at ``s + bar_interval``. The verifier requires a
+positive ``bar_interval``, passes it to the adapter as ``bars.attrs["bar_interval"]``, and runs
+truncation/mutation on this availability clock. All research timestamps (event_time,
+feature_asof_time, target_start, target_end) are information times on this clock.
 """
 from __future__ import annotations
 
@@ -41,10 +44,10 @@ TARGET_NAME_COL = "target_name"
 TARGET_VALUE_COL = "target_value"
 REQUIRED_FUNCTIONS = ("events", "features", "targets")
 MODEL_FUNCTION = "fit_predict_fold"
-# An adapter may set this module attribute to True to document that features() intentionally
-# omits some events (for example, warm-up events). Omitted events are then reported as INFO and
-# excluded from modelling instead of failing the contract.
-ALLOW_MISSING_FEATURES_ATTR = "FEATURES_ALLOW_MISSING_EVENTS"
+# There is deliberately NO candidate-controlled way to omit feature rows. Every event must have
+# exactly one feature row; a feature that is not yet defined (warm-up) is NaN inside that row.
+# Warm-up eligibility belongs to the frozen feature specification/engine, never to the candidate.
+BAR_INTERVAL_ATTR = "bar_interval"
 
 # ---------------------------------------------------------------------------
 # Feature/target firewall: centralized reserved-name logic.
@@ -126,19 +129,87 @@ def _frame_or_error(value: Any, name: str) -> pd.DataFrame:
     return value.copy().reset_index(drop=True)
 
 
-def run_pipeline(adapter: Any, bars: pd.DataFrame) -> ResearchTables:
+def parse_bar_interval(value: str | pd.Timedelta | None) -> pd.Timedelta:
+    """Explicit, strictly positive bar duration. There is deliberately no default."""
+    if value is None:
+        raise ValueError("bar_interval is required: bars are open-stamped and become known at open + bar_interval")
+    interval = pd.Timedelta(value)
+    if interval <= pd.Timedelta(0):
+        raise ValueError(f"bar_interval must be positive, got {interval}")
+    return interval
+
+
+def information_index(bars: pd.DataFrame, bar_interval: pd.Timedelta) -> pd.DatetimeIndex:
+    """Time at which each bar is fully known: open timestamp + bar_interval."""
+    return bars.index + bar_interval
+
+
+def _with_interval(bars: pd.DataFrame, bar_interval: pd.Timedelta) -> pd.DataFrame:
+    frame = bars.copy()
+    frame.attrs[BAR_INTERVAL_ATTR] = bar_interval
+    return frame
+
+
+def run_pipeline(adapter: Any, bars: pd.DataFrame, bar_interval: pd.Timedelta) -> ResearchTables:
     """Run events -> features -> targets on one bar frame. Missing functions yield ``None``.
 
-    The verifier passes its own copies so a candidate that mutates its input cannot alter the
-    verifier's reference bars.
+    Every call receives a fresh copy carrying ``attrs["bar_interval"]`` so a candidate that
+    mutates its input cannot alter the verifier's reference bars, and never has to guess the clock.
     """
     caps = adapter_capabilities(adapter)
     if not caps["events"]:
         return ResearchTables(None, None, None)
-    events = _frame_or_error(adapter.events(bars.copy()), "events")
-    features = _frame_or_error(adapter.features(bars.copy(), events.copy()), "features") if caps["features"] else None
-    targets = _frame_or_error(adapter.targets(bars.copy(), events.copy()), "targets") if caps["targets"] else None
+    events = _frame_or_error(adapter.events(_with_interval(bars, bar_interval)), "events")
+    features = _frame_or_error(adapter.features(_with_interval(bars, bar_interval), events.copy()), "features") if caps["features"] else None
+    targets = _frame_or_error(adapter.targets(_with_interval(bars, bar_interval), events.copy()), "targets") if caps["targets"] else None
     return ResearchTables(events, features, targets)
+
+
+GRANULARITY_QUANTILE = 0.01
+
+
+def nominal_granularity(index: pd.DatetimeIndex) -> pd.Timedelta | None:
+    """Nominal bar spacing, robust to missing bars.
+
+    Missing source bars only ever ENLARGE adjacent deltas, so gaps (sessions, weekends, dropped
+    minutes) sit in the upper tail and never change a low quantile. Using the 1% quantile rather
+    than the minimum also stops a handful of stray off-grid stamps from making the check lenient.
+    """
+    diffs = pd.Series(index[1:] - index[:-1])
+    diffs = diffs[diffs > pd.Timedelta(0)]
+    if diffs.empty:
+        return None
+    ns = np.quantile(diffs.dt.total_seconds().to_numpy(float) * 1e9, GRANULARITY_QUANTILE, method="lower")
+    return pd.Timedelta(int(ns), unit="ns")
+
+
+def audit_bar_interval(bars: pd.DataFrame, bar_interval: pd.Timedelta) -> list[Finding]:
+    """The declared interval must not be SHORTER than the nominal granularity (that would treat bar
+    closes as known before the bar ends). Gaps between bars are legitimate and never fail. A
+    longer declared interval is stricter and passes."""
+    granularity = nominal_granularity(bars.index)
+    if granularity is None:
+        return [_f("bar_interval_declaration", "UNVERIFIED", "fewer than two bars; declared bar_interval cannot be checked")]
+    diffs = pd.Series(bars.index[1:] - bars.index[:-1])
+    evidence = {
+        "declared": str(bar_interval), "nominal_granularity": str(granularity),
+        "quantile": GRANULARITY_QUANTILE, "gaps_longer_than_declared": int((diffs > bar_interval).sum()),
+        "spacings_shorter_than_declared": int(((diffs > pd.Timedelta(0)) & (diffs < bar_interval)).sum()),
+    }
+    if bar_interval < granularity:
+        return [_f(
+            "bar_interval_declaration", "FAIL",
+            f"declared bar_interval={bar_interval} is shorter than the nominal bar granularity {granularity}; "
+            "bar closes would be treated as known before the bar ends",
+            classification=PROVEN, evidence=evidence,
+        )]
+    note = "" if bar_interval == granularity else f" (longer than nominal granularity {granularity}: stricter)"
+    return [_f(
+        "bar_interval_declaration", "PASS",
+        f"bar_interval={bar_interval}; bar stamped s is known at s + {bar_interval}{note}; "
+        f"{evidence['gaps_longer_than_declared']} gaps (missing bars) tolerated",
+        evidence=evidence,
+    )]
 
 
 # ---------------------------------------------------------------------------
@@ -194,8 +265,11 @@ def event_time_lookup(events: pd.DataFrame) -> pd.Series:
 # ---------------------------------------------------------------------------
 # Events
 # ---------------------------------------------------------------------------
-def audit_events(events: pd.DataFrame, bars_index: pd.DatetimeIndex | None = None) -> tuple[list[Finding], bool]:
-    """Return findings and whether downstream stages may rely on the events table."""
+def audit_events(events: pd.DataFrame, available_index: pd.DatetimeIndex | None = None) -> tuple[list[Finding], bool]:
+    """Return findings and whether downstream stages may rely on the events table.
+
+    ``available_index`` is the information clock (bar open + bar_interval).
+    """
     findings: list[Finding] = []
     missing = _missing_columns(events, EVENT_REQUIRED)
     if missing:
@@ -248,12 +322,13 @@ def audit_events(events: pd.DataFrame, bars_index: pd.DatetimeIndex | None = Non
             else f"events are not in chronological order; first backwards rows {backwards[:10].tolist()}",
             rows=backwards[:20].tolist() if not ordered else None, classification=None if ordered else PROVEN,
         ))
-        if bars_index is not None and len(bars_index):
-            first, last = bars_index[0], bars_index[-1]
+        if available_index is not None and len(available_index):
+            first, last = available_index[0], available_index[-1]
             outside = (times < first) | (times > last)
             findings.append(_f(
                 "events_within_data", "FAIL" if outside.any() else "PASS",
-                f"{int(outside.sum())} events are timestamped outside the supplied bars [{first.isoformat()}, {last.isoformat()}]"
+                f"{int(outside.sum())} events are timestamped outside the information clock of the supplied bars "
+                f"[first bar known {first.isoformat()}, last bar known {last.isoformat()}]"
                 + (f"; e.g. {_sample_ids(events.loc[outside, 'event_id'])}" if outside.any() else ""),
                 rows=np.flatnonzero(outside.to_numpy())[:20].tolist() if outside.any() else None,
                 classification=PROVEN if outside.any() else None,
@@ -269,9 +344,9 @@ def feature_columns(features: pd.DataFrame) -> list[str]:
     return [c for c in features.columns if c not in FEATURE_KEYS]
 
 
-def audit_features(
-    features: pd.DataFrame, events: pd.DataFrame, *, allow_missing_events: bool = False,
-) -> tuple[list[Finding], bool]:
+def audit_features(features: pd.DataFrame, events: pd.DataFrame) -> tuple[list[Finding], bool]:
+    """Exactly one feature row per event. Omitting a row removes the event from modelling, which a
+    candidate could do selectively, so any omission FAILs; undefined values must be NaN instead."""
     findings: list[Finding] = []
     missing = _missing_columns(features, FEATURE_KEYS)
     if missing:
@@ -297,20 +372,15 @@ def audit_features(
         rows=np.flatnonzero(unknown.to_numpy())[:20].tolist() if unknown.any() else None, classification=PROVEN if unknown.any() else None,
     ))
     absent = sorted(event_ids - set(ids.tolist()), key=str)
-    if absent and allow_missing_events:
-        findings.append(_f(
-            "features_cover_events", "INFO",
-            f"{len(absent)} events have no feature row; adapter documents {ALLOW_MISSING_FEATURES_ATTR}=True, so they are excluded from modelling; e.g. {_sample_ids(absent)}",
-        ))
-    else:
-        findings.append(_f(
-            "features_cover_events", "FAIL" if absent else "PASS",
-            f"{len(absent)} events have no feature row" + (f"; e.g. {_sample_ids(absent)}" if absent else ""),
-            classification=PROVEN if absent else None,
-        ))
+    findings.append(_f(
+        "features_cover_events", "FAIL" if absent else "PASS",
+        f"{len(absent)} events have no feature row (omission is never allowed; use NaN for undefined/warm-up values)"
+        + (f"; e.g. {_sample_ids(absent)}" if absent else ""),
+        classification=PROVEN if absent else None,
+    ))
     time_findings, time_ok = _time_checks(features, "feature_asof_time", "features")
     findings += time_findings
-    usable = bool(columns) and time_ok and not dup.any() and not unknown.any() and (allow_missing_events or not absent)
+    usable = bool(columns) and time_ok and not dup.any() and not unknown.any() and not absent
     if time_ok and not unknown.any():
         event_time = event_time_lookup(events)
         asof = to_utc(features["feature_asof_time"])
@@ -376,8 +446,10 @@ def select_target(targets: pd.DataFrame, target_name: str) -> pd.DataFrame:
 
 
 def audit_targets(
-    targets: pd.DataFrame, events: pd.DataFrame, bars_index: pd.DatetimeIndex | None = None,
+    targets: pd.DataFrame, events: pd.DataFrame, available_index: pd.DatetimeIndex | None = None,
 ) -> tuple[list[Finding], bool]:
+    """``target_start >= event_time`` means the forward window starts with bars opening at or after
+    the event is known, so the signal bar's own movement can never enter a label."""
     findings: list[Finding] = []
     missing = _missing_columns(targets, TARGET_KEYS)
     if missing:
@@ -427,11 +499,11 @@ def audit_targets(
             rows=np.flatnonzero(inverted.to_numpy())[:20].tolist() if inverted.any() else None, classification=PROVEN if inverted.any() else None,
         ))
         ok &= not early.any() and not inverted.any()
-        if bars_index is not None and len(bars_index):
-            beyond = end > bars_index[-1]
+        if available_index is not None and len(available_index):
+            beyond = end > available_index[-1]
             findings.append(_f(
                 "targets_resolved_within_data", "FAIL" if beyond.any() else "PASS",
-                f"{int(beyond.sum())} targets claim target_end after the final bar {bars_index[-1].isoformat()}; unresolved targets must be omitted"
+                f"{int(beyond.sum())} targets claim target_end after the final bar is known ({available_index[-1].isoformat()}); unresolved targets must be omitted"
                 + (f"; e.g. {_sample_ids(ids[beyond])}" if beyond.any() else ""),
                 rows=np.flatnonzero(beyond.to_numpy())[:20].tolist() if beyond.any() else None, classification=PROVEN if beyond.any() else None,
             ))
@@ -439,20 +511,146 @@ def audit_targets(
     return findings, ok
 
 
-def audit_target_selection(targets: pd.DataFrame, target_name: str | None) -> tuple[list[Finding], bool]:
+@dataclass(frozen=True)
+class TargetHorizon:
+    """Externally declared MAXIMUM label horizon (never read from the candidate or its labels).
+
+    Exactly one of:
+    * ``bars``: the window is the first ``bars`` bars whose open is at/after ``event_time``; it is
+      resolved when the last of those bars completes (open + bar_interval). Gap-tolerant.
+    * ``duration``: the window ends at ``event_time + duration`` (wall clock).
+    """
+    bars: int | None = None
+    duration: pd.Timedelta | None = None
+
+    def __post_init__(self) -> None:
+        if (self.bars is None) == (self.duration is None):
+            raise ValueError("TargetHorizon needs exactly one of bars or duration")
+        if self.bars is not None and self.bars < 1:
+            raise ValueError("TargetHorizon.bars must be >= 1")
+        if self.duration is not None and self.duration <= pd.Timedelta(0):
+            raise ValueError("TargetHorizon.duration must be positive")
+
+    def describe(self) -> str:
+        return f"{self.bars} bars" if self.bars is not None else f"{self.duration} (wall clock)"
+
+
+def parse_target_horizon(value: "TargetHorizon | str | None") -> TargetHorizon | None:
+    """``"60bars"``/``"60 bars"`` -> bar count; ``"60min"``/``"4h"`` -> wall-clock duration."""
+    if value is None or isinstance(value, TargetHorizon):
+        return value
+    text = str(value).strip()
+    match = re.fullmatch(r"(\d+)\s*bars?", text, flags=re.IGNORECASE)
+    if match:
+        return TargetHorizon(bars=int(match.group(1)))
+    return TargetHorizon(duration=pd.Timedelta(text))  # unit case preserved ("30D", "60min")
+
+
+def declared_resolution_times(
+    events: pd.DataFrame, bar_opens: pd.DatetimeIndex, bar_interval: pd.Timedelta, horizon: TargetHorizon,
+) -> pd.Series:
+    """event_id -> time at which the DECLARED horizon is fully resolved, NaT if the data ends first.
+
+    Depends only on timestamps and the declared horizon, never on any label or outcome.
+    """
+    times = pd.DatetimeIndex(to_utc(events["event_time"]))
+    data_end = bar_opens[-1] + bar_interval
+    if horizon.bars is not None:
+        first = bar_opens.searchsorted(times, side="left")  # first bar opening at/after the event
+        last = first + horizon.bars - 1
+        resolvable = last < len(bar_opens)
+        end = pd.Series(pd.NaT, index=range(len(times)), dtype="datetime64[ns, UTC]")
+        if resolvable.any():
+            end[resolvable] = (bar_opens[last[resolvable]] + bar_interval).as_unit("ns")
+    else:
+        end = pd.Series((times + horizon.duration).as_unit("ns"))
+        end[end > data_end] = pd.NaT
+    return pd.Series(end.to_numpy(), index=pd.Index(events["event_id"].to_numpy(), dtype=object))
+
+
+def audit_target_selection(
+    targets: pd.DataFrame, target_name: str | None, events: pd.DataFrame, bar_opens: pd.DatetimeIndex,
+    bar_interval: pd.Timedelta, horizon: TargetHorizon | None,
+) -> tuple[list[Finding], bool, set]:
+    """Select the modelling target, prove labels were not selected on the outcome, and return the
+    verifier-determined set of modelling-eligible event IDs.
+
+    With a declared horizon, eligibility is a pure timestamp rule:
+
+        required(event)  <=>  declared horizon resolves before the data ends
+
+    * a required event without a finite label           -> FAIL target_coverage (outcome selection)
+    * a label whose target_end exceeds the declared end   -> FAIL target_horizon_respected
+    * a label on an event whose horizon is unresolvable   -> excluded BY THE VERIFIER (a candidate
+      could otherwise keep only the tail events whose outcome resolved early)
+
+    Without a declared horizon, target_coverage is UNVERIFIED (never inferred from emitted labels).
+    """
     if target_name is None:
-        return [_f("target_selection", "UNVERIFIED", "no --target supplied; walk-forward modelling and ML leakage cannot be audited")], False
+        return [_f("target_selection", "UNVERIFIED", "no --target supplied; walk-forward modelling and ML leakage cannot be audited")], False, set()
     try:
         selected = select_target(targets, target_name)
     except ValueError as exc:
-        return [_f("target_selection", "FAIL", str(exc), classification=PROVEN)], False
+        return [_f("target_selection", "FAIL", str(exc), classification=PROVEN)], False, set()
     finite = np.isfinite(selected["value"].to_numpy(float))
-    status = "PASS" if finite.any() else "FAIL"
-    return [_f(
-        "target_selection", status,
-        f"target {target_name!r}: {int(finite.sum())} finite labels, {int((~finite).sum())} nonfinite/non-numeric (excluded from modelling)",
-        classification=None if finite.any() else PROVEN,
-    )], bool(finite.any())
+    if not finite.any():
+        return [_f("target_selection", "FAIL", f"target {target_name!r} has no finite labels", classification=PROVEN)], False, set()
+    findings = [_f("target_selection", "PASS", f"target {target_name!r}: {int(finite.sum())} finite labels")]
+    labelled = selected[finite].set_index(pd.Index(selected.loc[finite, "event_id"].to_numpy(), dtype=object))
+    if horizon is None:
+        findings.append(_f(
+            "target_coverage", "UNVERIFIED",
+            "no declared target horizon (--target-horizon); label coverage cannot be proven and is never inferred "
+            "from the labels the candidate emits",
+        ))
+        return findings, True, set(labelled.index)
+    declared_end = declared_resolution_times(events, bar_opens, bar_interval, horizon)
+    required = declared_end.notna()
+    required_ids = set(declared_end.index[required])
+    labelled_ids = set(labelled.index)
+    missing = sorted(required_ids - labelled_ids, key=str)
+    overlap = sorted(required_ids & labelled_ids, key=str)
+    idx = pd.Index(overlap, dtype=object)
+    too_long = [str(i) for i, end, limit in zip(idx, to_utc(labelled.loc[idx, "target_end"]), declared_end.reindex(idx)) if end > limit]
+    excluded_tail = sorted(labelled_ids - required_ids, key=str)
+    evidence = {
+        "declared_horizon": horizon.describe(), "events": len(events), "required": len(required_ids),
+        "labelled": len(labelled_ids), "missing_required": len(missing),
+        "unresolvable_tail": int((~required).sum()), "tail_labels_excluded_by_verifier": len(excluded_tail),
+        "data_end": (bar_opens[-1] + bar_interval).isoformat(),
+    }
+    ok = True
+    if missing:
+        ok = False
+        findings.append(_f(
+            "target_coverage", "FAIL",
+            f"{len(missing)} events whose declared horizon ({horizon.describe()}) resolves inside the data have no finite "
+            f"{target_name!r} label; labels may be missing only because the horizon is unresolved, never because of the "
+            f"outcome. e.g. {_sample_ids(missing)}",
+            classification=PROVEN, evidence={**evidence, "illegal_ids": _sample_ids(missing, 50)},
+        ))
+    else:
+        findings.append(_f(
+            "target_coverage", "PASS",
+            f"all {len(required_ids)} events whose declared horizon ({horizon.describe()}) resolves inside the data have a "
+            f"finite label; {evidence['unresolvable_tail']} tail events are ineligible by timestamp",
+            evidence=evidence,
+        ))
+    if too_long:
+        ok = False
+        findings.append(_f(
+            "target_horizon_respected", "FAIL",
+            f"{len(too_long)} labels end after their declared horizon ({horizon.describe()}); e.g. {too_long[:10]}",
+            classification=PROVEN, evidence={"ids": too_long[:50]},
+        ))
+    else:
+        findings.append(_f("target_horizon_respected", "PASS", f"no label ends after its declared horizon ({horizon.describe()})"))
+    if excluded_tail:
+        findings.append(_f(
+            "target_tail_exclusion", "INFO",
+            f"{len(excluded_tail)} labels on events whose declared horizon is unresolvable were excluded from modelling by the verifier",
+        ))
+    return findings, ok, required_ids & labelled_ids
 
 
 # ---------------------------------------------------------------------------
@@ -556,16 +754,21 @@ def audit_determinism(first: ResearchTables, second: ResearchTables) -> list[Fin
 
 def audit_research_contract(
     adapter_factory: Callable[[], Any], bars: pd.DataFrame, *, target_name: str | None,
-) -> tuple[list[Finding], ResearchTables | None, dict[str, bool]]:
+    bar_interval: pd.Timedelta | str, target_horizon: TargetHorizon | str | None = None,
+) -> tuple[list[Finding], ResearchTables | None, dict[str, Any]]:
     """Run the full contract audit.
+
+    ``ready["eligible_ids"]`` is the verifier-determined modelling sample (timestamp rule only).
 
     Returns findings, the full-sample tables (``None`` if the adapter cannot run), and a dict of
     readiness flags: events_ok, features_ok, targets_ok, target_ok, model_available.
     """
+    bar_interval = parse_bar_interval(bar_interval)
     adapter = adapter_factory()
     caps = adapter_capabilities(adapter)
-    ready = {"events_ok": False, "features_ok": False, "targets_ok": False, "target_ok": False,
-             "model_available": caps[MODEL_FUNCTION]}
+    horizon = parse_target_horizon(target_horizon)
+    ready: dict[str, Any] = {"events_ok": False, "features_ok": False, "targets_ok": False, "target_ok": False,
+                             "model_available": caps[MODEL_FUNCTION], "eligible_ids": set()}
     findings: list[Finding] = [_f(
         "adapter_interface", "PASS" if all(caps[n] for n in REQUIRED_FUNCTIONS) else "UNVERIFIED",
         f"exposed functions: {caps}" + ("" if all(caps[n] for n in REQUIRED_FUNCTIONS) else f"; required {list(REQUIRED_FUNCTIONS)} missing -> dependent checks UNVERIFIED"),
@@ -574,34 +777,37 @@ def audit_research_contract(
     if not isinstance(bars.index, pd.DatetimeIndex) or bars.index.tz is None:
         findings.append(_f("bars_index", "FAIL", "bars must have a timezone-aware DatetimeIndex", classification=PROVEN))
         return findings, None, ready
+    findings += audit_bar_interval(bars, bar_interval)
+    available = information_index(bars, bar_interval)
     try:
-        tables = run_pipeline(adapter, bars)
-        repeat = run_pipeline(adapter_factory(), bars)
+        tables = run_pipeline(adapter, bars, bar_interval)
+        repeat = run_pipeline(adapter_factory(), bars, bar_interval)
     except Exception as exc:
         findings.append(_f("candidate_execution", "FAIL", f"{type(exc).__name__}: {exc}", classification=PROVEN))
         return findings, None, ready
     if tables.events is None:
         findings.append(_f("events_contract", "UNVERIFIED", "adapter exposes no events(bars)"))
         return findings, tables, ready
-    event_findings, ready["events_ok"] = audit_events(tables.events, bars.index)
+    event_findings, ready["events_ok"] = audit_events(tables.events, available)
     findings += event_findings
     findings += audit_determinism(tables, repeat)
     if not ready["events_ok"]:
         findings.append(_f("downstream_contract", "UNVERIFIED", "events table unusable; feature/target contract checks not evaluated"))
         return findings, tables, ready
-    allow_missing = bool(getattr(adapter, ALLOW_MISSING_FEATURES_ATTR, False))
     if tables.features is None:
         findings.append(_f("features_contract", "UNVERIFIED", "adapter exposes no features(bars, events)"))
     else:
-        feature_findings, ready["features_ok"] = audit_features(tables.features, tables.events, allow_missing_events=allow_missing)
+        feature_findings, ready["features_ok"] = audit_features(tables.features, tables.events)
         findings += feature_findings
     if tables.targets is None:
         findings.append(_f("targets_contract", "UNVERIFIED", "adapter exposes no targets(bars, events)"))
     else:
-        target_findings, ready["targets_ok"] = audit_targets(tables.targets, tables.events, bars.index)
+        target_findings, ready["targets_ok"] = audit_targets(tables.targets, tables.events, available)
         findings += target_findings
         if ready["targets_ok"]:
-            selection, ready["target_ok"] = audit_target_selection(tables.targets, target_name)
+            selection, ready["target_ok"], ready["eligible_ids"] = audit_target_selection(
+                tables.targets, target_name, tables.events, bars.index, bar_interval, horizon,
+            )
             findings += selection
     if tables.features is not None and set(FEATURE_KEYS).issubset(tables.features.columns):
         findings += audit_firewall(tables.features, tables.targets if ready["targets_ok"] else None)

@@ -4,6 +4,10 @@ This is a verifier fixture and a starting template, NOT a research engine. Its t
 and toy features exist only so the verifier can be shown to pass causal code. Do not treat any
 output of this file as evidence of edge.
 
+Information clock: bars are OPEN-stamped. A bar stamped ``s`` is fully known at
+``s + bars.attrs["bar_interval"]`` (supplied by the verifier; never guessed here). Every
+research timestamp below is an information time on that clock.
+
 Contract (see docs/RESEARCH_VERIFICATION.md):
     events(bars) -> event_id, event_time, direction
     features(bars, events) -> event_id, feature_asof_time, <features>
@@ -20,29 +24,40 @@ TARGET = "forward_return_10"
 FEATURE_COLUMNS = ["ret_5", "vol_20", "dist_ma_20"]
 
 
+def _interval(bars: pd.DataFrame) -> pd.Timedelta:
+    value = bars.attrs.get("bar_interval")
+    if value is None:
+        raise ValueError("bars.attrs['bar_interval'] missing; run through scripts/verify_research.py --bar-interval")
+    return pd.Timedelta(value)
+
+
+def _signal_positions(bars: pd.DataFrame, events: pd.DataFrame) -> np.ndarray:
+    return bars.index.get_indexer(pd.DatetimeIndex(events["event_time"]) - _interval(bars))
+
+
 def events(bars: pd.DataFrame) -> pd.DataFrame:
-    """Every third bar after a 20-bar warm-up; knowable at the bar's own timestamp."""
+    """Every third bar after a 20-bar warm-up; knowable when that bar CLOSES (open + interval)."""
     position = np.arange(len(bars))
     mask = (position >= 20) & (position % 3 == 0)
     close = bars["close"].to_numpy(float)
     moving_average = bars["close"].rolling(20).mean().to_numpy(float)
-    times = bars.index[mask]
+    opens = bars.index[mask]
     return pd.DataFrame({
-        "event_id": [f"E{t:%Y%m%dT%H%M%S}" for t in times],
-        "event_time": pd.Series(times),
+        "event_id": [f"E{t:%Y%m%dT%H%M%S}" for t in opens],
+        "event_time": pd.Series(opens + _interval(bars)),
         "direction": np.where(close[mask] >= moving_average[mask], "long", "short"),
     })
 
 
 def features(bars: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
-    """Trailing-only features, as of the event bar."""
+    """Trailing-only features computed through the signal bar's close."""
     close = bars["close"]
     table = pd.DataFrame({
         "ret_5": close / close.shift(5) - 1.0,
         "vol_20": close.pct_change().rolling(20).std(),
         "dist_ma_20": close / close.rolling(20).mean() - 1.0,
     }, index=bars.index)
-    rows = table.reindex(pd.DatetimeIndex(events["event_time"]))
+    rows = table.iloc[_signal_positions(bars, events)]
     out = pd.DataFrame({"event_id": events["event_id"].to_numpy(), "feature_asof_time": events["event_time"].reset_index(drop=True)})
     for column in FEATURE_COLUMNS:
         out[column] = rows[column].to_numpy()
@@ -50,16 +65,21 @@ def features(bars: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
 
 
 def targets(bars: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
-    """Forward return over HORIZON bars. Events whose window is unresolved are omitted."""
+    """Forward return over the next HORIZON bars (all opening at/after the event).
+
+    Resolved when the last window bar closes. Events whose window is unresolved are omitted:
+    by timestamp only, never by outcome.
+    """
     close = bars["close"].to_numpy(float)
-    position = bars.index.get_indexer(pd.DatetimeIndex(events["event_time"]))
+    position = _signal_positions(bars, events)
     resolved = position + HORIZON < len(bars)
     p = position[resolved]
     end = p + HORIZON
+    empty = pd.DatetimeIndex([], tz=bars.index.tz)
     return pd.DataFrame({
         "event_id": events["event_id"].to_numpy()[resolved],
-        "target_start": pd.Series(bars.index[p + 1] if len(p) else pd.DatetimeIndex([], tz=bars.index.tz)),
-        "target_end": pd.Series(bars.index[end] if len(p) else pd.DatetimeIndex([], tz=bars.index.tz)),
+        "target_start": pd.Series(bars.index[p + 1] if len(p) else empty),
+        "target_end": pd.Series(bars.index[end] + _interval(bars) if len(p) else empty),
         TARGET: close[end] / close[p] - 1.0 if len(p) else np.array([], dtype=float),
     })
 

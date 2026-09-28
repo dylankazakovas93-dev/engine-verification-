@@ -77,6 +77,10 @@ ML or conditional-edge research engines are verified with `scripts/verify_resear
 builds purged walk-forward folds and controls the lockbox. Mandatory families: `research_contract`,
 `research_causality`, `walkforward`, `ml_leakage`, `lockbox`, `ml_static_scan` (plus
 `repository_health`, `data_audit`, `contract_provenance`). Never add a lockbox performance path.
+Bars are open-stamped and known only at `open + --bar-interval`; every research timestamp is an
+information time on that clock. Labels may be missing only by timestamp (unresolved tail under
+the externally declared `--target-horizon`), never by outcome. Candidates cannot omit feature
+rows; warm-up and horizons belong to the frozen feature/target specification.
 A research cheat found later becomes a new toy in `tests/research_toys.py` before any fix.
 
 ## Interpretation boundary

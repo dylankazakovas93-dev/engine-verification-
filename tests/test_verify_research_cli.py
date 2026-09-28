@@ -35,7 +35,9 @@ def _run(tmp_path: Path, adapter: Path, target: str, *extra: str):
     result = subprocess.run(
         [sys.executable, str(REPO / "scripts" / "verify_research.py"), "--adapter", str(adapter),
          "--data", str(data), "--timestamp-col", "timestamp", "--target", target,
-         "--lockbox-start", T.LOCKBOX, "--mode", "fast", "--skip-tests", "--report-prefix", str(prefix), *extra],
+         "--lockbox-start", T.LOCKBOX, "--mode", "fast", "--bar-interval", "1D",
+         "--target-horizon", T.HORIZON_SPEC, "--skip-tests",
+         "--report-prefix", str(prefix), *extra],
         cwd=REPO, text=True, capture_output=True,
     )
     payload = json.loads(prefix.with_suffix(".json").read_text())
@@ -83,3 +85,24 @@ def test_full_table_statistic_is_flagged_for_manual_review(tmp_path):
     result, payload = _run(tmp_path, adapter, T.TARGET, "--source", str(source))
     assert payload["artifacts"]["family_status"]["ml_static_scan"] == "UNVERIFIED"
     assert result.returncode == 2
+
+
+def test_bar_interval_is_required_and_no_report_is_written_without_it(tmp_path):
+    data = tmp_path / "bars.csv"
+    _write_bars(data)
+    prefix = tmp_path / "report"
+    result = subprocess.run(
+        [sys.executable, str(REPO / "scripts" / "verify_research.py"), "--adapter", str(TEMPLATE),
+         "--data", str(data), "--target", "forward_return_10", "--skip-tests", "--report-prefix", str(prefix)],
+        cwd=REPO, text=True, capture_output=True,
+    )
+    assert result.returncode != 0 and "--bar-interval" in result.stderr
+    assert not prefix.with_suffix(".json").exists()
+
+
+def test_cli_rejects_bar_open_event_stamping(tmp_path):
+    adapter = _toy_adapter(tmp_path / "bar_open_adapter.py", "EventAtBarStart")
+    result, payload = _run(tmp_path, adapter, T.TARGET)
+    assert result.returncode == 1
+    assert payload["artifacts"]["family_status"]["research_causality"] == "FAIL"
+    assert payload["artifacts"]["information_clock"]["bar_known_at"] == "open + 1 days 00:00:00"

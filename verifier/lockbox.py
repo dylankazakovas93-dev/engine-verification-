@@ -58,8 +58,11 @@ class LockboxSplit:
 
 def split_lockbox(
     events: pd.DataFrame, features: pd.DataFrame | None, targets: pd.DataFrame | None,
-    lockbox_start: pd.Timestamp | None,
+    lockbox_start: pd.Timestamp | None, resolution_times: pd.Series | None = None,
 ) -> LockboxSplit:
+    """``resolution_times`` (event_id -> declared-horizon resolution time, bar open + interval of the
+    Nth window bar) widens the boundary rule: an event is also withheld when its DECLARED horizon
+    resolves at/after the lockbox, even if the candidate's claimed target_end is earlier."""
     event_time = pd.Series(to_utc(events["event_time"]).array, index=pd.Index(events["event_id"].to_numpy(), dtype=object))
     if lockbox_start is None:
         dev = tuple(events["event_id"].tolist())
@@ -71,6 +74,9 @@ def split_lockbox(
         end = to_utc(targets["target_end"])
         crossing = targets.loc[end >= lockbox_start, "event_id"].tolist()
         boundary = {i for i in crossing if i not in withheld}
+    if resolution_times is not None and not resolution_times.empty:
+        declared = pd.to_datetime(resolution_times, utc=True)
+        boundary |= {i for i in declared.index[(declared >= lockbox_start).to_numpy()] if i not in withheld}
     removed = withheld | boundary
     ordered_ids = events["event_id"].tolist()
     dev = tuple(i for i in ordered_ids if i not in removed)
